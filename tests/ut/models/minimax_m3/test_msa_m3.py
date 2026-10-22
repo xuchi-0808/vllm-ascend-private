@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import builtins
 import inspect
 import sys
 from dataclasses import dataclass
@@ -76,6 +77,15 @@ def mock_gbsa_ops(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, MagicMock
     gbsa_ops_module.generic_block_sparse_attention = gbsa_attention_op  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "cann_ops_transformer.ops", gbsa_ops_module)
     return gbsa_metadata_op, gbsa_attention_op
+
+
+@pytest.fixture
+def mock_bundled_msa_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.vllm_ascend_C",
+        ModuleType("vllm_ascend.vllm_ascend_C"),
+    )
 
 
 @dataclass
@@ -613,21 +623,12 @@ def test_sparse_prepare_bypasses_fused_qkv_norm_rope_on_a5() -> None:
     assert "1.0 + self.q_norm.weight" in source
 
 
-def test_a5_index_score_uses_ascendc_prefill_and_triton_decode() -> None:
-    module_source = inspect.getsource(msa_m3_module)
-    a5_branch_start = module_source.index("if get_ascend_device_type() == AscendDeviceType.A5:")
-    a5_branch_end = module_source.index("\n\ndef _should_use_tp_sharded_index_decode", a5_branch_start)
-    import_branches = module_source[a5_branch_start:a5_branch_end]
-
+def test_index_score_and_sparse_attention_use_npu_operators() -> None:
     assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_PREFILL is True
-    assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_DECODE is (
-        msa_m3_module.get_ascend_device_type() != AscendDeviceType.A5
-    )
-    assert import_branches.count("minimax_m3_index_decode") == 1
-    assert "msa_m3_triton_a5" in import_branches
-    assert "msa_m3_triton" not in import_branches.replace("msa_m3_triton_a5", "")
-    assert "_USE_ASCENDC_INDEX_SCORE_PREFILL = True" in module_source
-    assert "_USE_ASCENDC_INDEX_SCORE_DECODE = get_ascend_device_type() != AscendDeviceType.A5" in module_source
+    assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_DECODE is True
+    assert msa_m3_module.minimax_m3_index_decode_ascendc is minimax_m3_index_decode
+    assert msa_m3_module.minimax_m3_sparse_attn is msa_m3_npu_module.minimax_m3_sparse_attn
+    assert msa_m3_module.minimax_m3_sparse_attn_decode is minimax_m3_sparse_attn_decode_npu
     with patch(
         "vllm_ascend.models.minimax_m3.msa_m3.get_ascend_device_type",
         return_value=AscendDeviceType.A5,
@@ -728,19 +729,22 @@ def test_mrv2_non_dummy_forwards_are_not_skipped(
     assert _is_mrv2_idle_dp_dummy(forward_context, use_v2_model_runner=True) is False
 
 
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A3, AscendDeviceType.A5])
 @patch("vllm_ascend.models.minimax_m3.msa_m3.get_current_vllm_config")
 @patch("vllm_ascend.models.minimax_m3.msa_m3.get_tp_group")
 @patch("vllm_ascend.models.minimax_m3.msa_m3.get_forward_context")
-def test_mrv2_idle_dp_runs_first_indexer_layer_then_skips_repeats(
+def test_mrv2_idle_dp_skips_repeated_indexer_collectives_only_on_a3(
     mock_get_forward_context: MagicMock,
     mock_get_tp_group: MagicMock,
     mock_get_vllm_config: MagicMock,
+    device_type: AscendDeviceType,
 ) -> None:
     impl = object.__new__(AscendMiniMaxM3IndexerImpl)
     torch.nn.Module.__init__(impl)
     impl.use_v2_model_runner = True
     impl.num_index_heads = 1
     impl.index_head_dim = 4
+    impl.block_size = 128
     impl.topk_blocks = 2
     impl.init_blocks = 1
     impl.local_blocks = 1
@@ -777,22 +781,31 @@ def test_mrv2_idle_dp_runs_first_indexer_layer_then_skips_repeats(
     mock_get_vllm_config.side_effect = AssertionError("No current config during forward")
     expected = torch.zeros(1, 1, 2, dtype=torch.int32)
 
-    with patch(
-        "vllm_ascend.models.minimax_m3.msa_m3.minimax_m3_index_tp_block_parallel_decode",
-        return_value=expected,
-    ) as mock_decode:
+    with (
+        patch.object(msa_m3_module, "get_ascend_device_type", return_value=device_type),
+        patch.object(msa_m3_module, "minimax_m3_index_tp_block_parallel_decode", return_value=expected) as tp_decode,
+        patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=expected) as direct_decode,
+    ):
         first = impl.forward(torch.zeros(1, 4))
         second = impl.forward(torch.zeros(1, 4))
 
     assert first[0] is expected
     assert first[1:] == (None, None)
-    assert second == (None, None, None)
-    mock_decode.assert_called_once()
-    assert forward_context.additional_kwargs[msa_m3_module._MRV2_DUMMY_INDEXER_TP_WARMED_KEY]
-    assert forward_context.additional_kwargs[msa_m3_module._MRV2_SKIP_DUMMY_SPARSE_ATTN_KEY]
+    if device_type == AscendDeviceType.A3:
+        assert second == (None, None, None)
+        tp_decode.assert_called_once()
+        direct_decode.assert_not_called()
+        assert forward_context.additional_kwargs[msa_m3_module._MRV2_DUMMY_INDEXER_TP_WARMED_KEY]
+        assert forward_context.additional_kwargs[msa_m3_module._MRV2_SKIP_DUMMY_SPARSE_ATTN_KEY]
+    else:
+        assert second[0] is expected
+        assert second[1:] == (None, None)
+        assert direct_decode.call_count == 2
+        tp_decode.assert_not_called()
+        assert not forward_context.additional_kwargs
 
 
-def test_a5_indexer_forward_keeps_original_decode_path() -> None:
+def test_indexer_forward_keeps_triton_fallback_when_ascendc_disabled() -> None:
     impl = object.__new__(AscendMiniMaxM3IndexerImpl)
     torch.nn.Module.__init__(impl)
     impl.num_index_heads = 1
@@ -869,6 +882,91 @@ def test_a5_indexer_forward_keeps_original_decode_path() -> None:
         decode.decode_query_len,
     )
     assert mock_decode.call_args.kwargs == {"sm_scale": impl.scale}
+
+
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A3, AscendDeviceType.A5])
+@pytest.mark.parametrize("tp_size", [1, 4])
+@pytest.mark.parametrize("decode_query_len", [1, 2])
+def test_indexer_decode_uses_ascendc_with_runtime_metadata(
+    device_type: AscendDeviceType,
+    tp_size: int,
+    decode_query_len: int,
+) -> None:
+    impl = object.__new__(AscendMiniMaxM3IndexerImpl)
+    torch.nn.Module.__init__(impl)
+    impl.use_v2_model_runner = False
+    impl.num_index_heads = 1
+    impl.index_head_dim = 4
+    impl.block_size = 128
+    impl.topk_blocks = 2
+    impl.init_blocks = 1
+    impl.local_blocks = 1
+    cache_dtype = torch.float8_e4m3fn if device_type == AscendDeviceType.A5 else torch.bfloat16
+    impl.index_cache = SimpleNamespace(
+        prefix="layer.attn.index_cache",
+        kv_cache=torch.zeros(4, 128, 4, dtype=cache_dtype),
+    )
+    tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0)
+    expected = torch.zeros(1, decode_query_len, impl.topk_blocks, dtype=torch.int32)
+    common = _create_common_attn_metadata(
+        BatchSpec(seq_lens=[128 + decode_query_len], query_lens=[decode_query_len]),
+        block_size=128,
+        device=torch.device("cpu"),
+    )
+    with (
+        patch.object(msa_m3_module, "get_ascend_device_type", return_value=device_type),
+        patch.object(msa_m3_module, "get_tp_group", return_value=tp_group),
+        patch.object(msa_m3_module, "split_decodes_and_prefills", return_value=(1, 0, decode_query_len, 0)),
+    ):
+        metadata = _make_indexer_builder(torch.device("cpu"), tp_size=tp_size).build(0, common)
+        with (
+            patch.object(
+                msa_m3_module,
+                "get_forward_context",
+                return_value=SimpleNamespace(attn_metadata={impl.index_cache.prefix: metadata}),
+            ),
+            patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=expected) as direct_decode,
+            patch.object(
+                msa_m3_module, "minimax_m3_index_tp_block_parallel_decode", return_value=expected
+            ) as tp_decode,
+            patch.object(msa_m3_module, "minimax_m3_index_decode", create=True) as triton_decode,
+        ):
+            actual, prefill, select_num_idx = impl.forward(torch.zeros(decode_query_len, 4))
+
+    decode = metadata.decode
+    assert decode is not None
+    torch.testing.assert_close(decode.cu_seqlens_q, torch.tensor([0, decode_query_len], dtype=torch.int32))
+    torch.testing.assert_close(decode.context_lens, torch.tensor([128], dtype=torch.int32))
+    assert actual is expected
+    assert prefill is None
+    assert select_num_idx is None
+    triton_decode.assert_not_called()
+    if tp_size > 1 and device_type != AscendDeviceType.A5:
+        direct_decode.assert_not_called()
+        tp_decode.assert_called_once()
+        args, kwargs = tp_decode.call_args
+        assert decode.tp_score is not None
+        assert args[2] is decode.tp_score
+        assert decode.tp_score.cu_seqlens_q is decode.cu_seqlens_q
+        assert decode.tp_score.context_lens is decode.context_lens
+        assert kwargs["tp_group"] is tp_group
+    else:
+        assert decode.tp_score is None
+        tp_decode.assert_not_called()
+        direct_decode.assert_called_once()
+        args, kwargs = direct_decode.call_args
+        assert args[2] is decode.block_table
+        assert args[3] is decode.cu_seqlens_q
+        assert args[4] is decode.seq_lens
+        assert args[5] is decode.context_lens
+        torch.testing.assert_close(args[6], torch.tensor([1], dtype=torch.int32))
+        assert kwargs["decode_query_len"] == decode_query_len
+    assert args[0].shape == (decode_query_len, 1, 4)
+    assert args[1] is impl.index_cache.kv_cache
+    assert args[-1] is metadata.causal_mask
+    assert kwargs["topk"] == impl.topk_blocks
+    assert kwargs["init_blocks"] == impl.init_blocks
+    assert kwargs["local_blocks"] == impl.local_blocks
 
 
 def test_a5_indexer_forward_keeps_original_prefill_path() -> None:
@@ -1134,7 +1232,7 @@ def test_ascendc_index_cache_unwraps_runtime_tuple() -> None:
     assert actual.data_ptr() == index_key_cache.data_ptr()
 
 
-def test_ascendc_index_score_forwards_metadata_operands() -> None:
+def test_ascendc_index_score_forwards_metadata_operands(mock_bundled_msa_ops: None) -> None:
     idx_q = torch.zeros(1, 2, 128)
     index_key_cache = torch.zeros(4, 128, 128)
     block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
@@ -1144,11 +1242,15 @@ def test_ascendc_index_score_forwards_metadata_operands() -> None:
     causal_mask = torch.zeros(2048, 2048, dtype=torch.int8)
     expected = torch.zeros(2, 1, 4)
 
-    with patch(
-        "vllm_ascend.models.minimax_m3.ops.msa_m3_npu.torch.ops._C_ascend.npu_msa_index_score",
-        return_value=expected,
-        create=True,
-    ) as mock_index_score:
+    with (
+        patch.object(builtins, "__import__", wraps=builtins.__import__) as import_extension,
+        patch.object(msa_m3_npu_module, "enable_custom_op", return_value=False),
+        patch(
+            "vllm_ascend.models.minimax_m3.ops.msa_m3_npu.torch.ops._C_ascend.npu_msa_index_score",
+            return_value=expected,
+            create=True,
+        ) as mock_index_score,
+    ):
         actual = _minimax_m3_index_score(
             idx_q,
             index_key_cache,
@@ -1162,6 +1264,7 @@ def test_ascendc_index_score_forwards_metadata_operands() -> None:
         )
 
     assert actual is expected
+    assert any(call.args[0] == "vllm_ascend.vllm_ascend_C" for call in import_extension.call_args_list)
     args, kwargs = mock_index_score.call_args
     assert args[1].shape == (4, 128, 1, 128)
     assert args[3] is start_loc
@@ -1170,7 +1273,7 @@ def test_ascendc_index_score_forwards_metadata_operands() -> None:
     assert "local_blocks" not in kwargs
 
 
-def test_ascendc_index_score_casts_query_to_fp8_cache_dtype() -> None:
+def test_ascendc_index_score_casts_query_to_fp8_cache_dtype(mock_bundled_msa_ops: None) -> None:
     idx_q = torch.ones(1, 2, 128, dtype=torch.bfloat16)
     index_key_cache = torch.zeros(4, 128, 128, dtype=torch.float8_e4m3fn)
     block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
@@ -1227,7 +1330,7 @@ def test_bundled_ascendc_index_score_flushes_wide_a5_block_tables() -> None:
     assert "L0-fp8-wide-table-257" in example
 
 
-def test_ascendc_index_score_uses_dense_mode_without_mask() -> None:
+def test_ascendc_index_score_uses_dense_mode_without_mask(mock_bundled_msa_ops: None) -> None:
     idx_q = torch.zeros(1, 2, 128)
     index_key_cache = torch.zeros(4, 128, 128)
     block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
@@ -2347,15 +2450,17 @@ def test_m3_impls_provide_update_graph_params_protocol():
         assert params["speculative_config"].default is None
 
 
+@pytest.mark.parametrize("decode_query_len", [1, 2])
 def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
+    decode_query_len: int,
 ) -> None:
-    q = torch.tensor([[[500.0, -500.0, 1.0, -1.0]]], dtype=torch.bfloat16)
+    q = torch.tensor([[[500.0, -500.0, 1.0, -1.0]]] * decode_query_len, dtype=torch.bfloat16)
     kv_cache = torch.zeros(2, 1, 128, 1, 4, dtype=torch.float8_e4m3fn)
-    topk_idx = torch.tensor([[[0]]], dtype=torch.int32)
-    select_num_idx = torch.ones(1, 1, dtype=torch.int32)
+    topk_idx = torch.zeros(1, decode_query_len, 1, dtype=torch.int32)
+    select_num_idx = torch.ones(1, decode_query_len, dtype=torch.int32)
     block_table = torch.zeros(1, 1, dtype=torch.int32)
-    seq_lens = torch.ones(1, dtype=torch.int32)
+    seq_lens = torch.tensor([decode_query_len], dtype=torch.int32)
     dequant_scale = torch.ones((1, 1, 1, 1), dtype=torch.float32)
     output = torch.empty_like(q)
     metadata = torch.empty(1024, dtype=torch.int32)
@@ -2363,7 +2468,7 @@ def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
     gbsa_metadata_op.return_value = metadata
     gbsa_attention_op.return_value = (torch.ones_like(output), torch.empty(0))
 
-    minimax_m3_sparse_attn_decode_npu(
+    msa_m3_module.minimax_m3_sparse_attn_decode(
         q,
         kv_cache,
         topk_idx,
@@ -2372,17 +2477,17 @@ def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
         num_kv_heads=1,
         sm_scale=0.5,
         output=output,
-        decode_query_len=1,
+        decode_query_len=decode_query_len,
         select_num_idx=select_num_idx,
         dequant_scale=dequant_scale,
     )
 
     metadata_kwargs = gbsa_metadata_op.call_args.kwargs
     assert metadata_kwargs["quant_mode"] == 5
-    assert metadata_kwargs["max_seqlen_q"] == 1
+    assert metadata_kwargs["max_seqlen_q"] == decode_query_len
     assert torch.equal(
         metadata_kwargs["cu_seqlens_q"],
-        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([0, decode_query_len], dtype=torch.int64),
     )
 
     args = gbsa_attention_op.call_args.args
@@ -2390,6 +2495,7 @@ def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
     assert args[0].dtype == torch.float8_e4m3fn
     assert args[1].dtype == torch.float8_e4m3fn
     assert args[2].dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(args[0].float(), q.float().clamp(-448, 448))
     assert torch.equal(args[4], select_num_idx)
     assert kwargs["quant_mode"] == 5
     assert "q_dequant_scale" not in kwargs
@@ -2464,7 +2570,7 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
         patch.object(msa_m3_npu_module, "_npu_k2q_csr") as k2q,
         patch("torch.ops._C_ascend.npu_sparse_attention_score_prefill", create=True) as split_kv,
     ):
-        msa_m3_npu_module.minimax_m3_sparse_attn(
+        msa_m3_module.minimax_m3_sparse_attn(
             q,
             kv_cache,
             topk_idx,

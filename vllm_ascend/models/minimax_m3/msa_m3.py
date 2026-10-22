@@ -56,10 +56,10 @@ from vllm_ascend.ops.linear import AscendColumnParallelLinear
 from vllm_ascend.ops.linear_op import get_parallel_op
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-# The bundled MsaIndexScore includes the Ascend 950 arch35 FP8 kernel. Keep it
-# enabled for A5 prefill, while A5 decode uses its lower-latency Triton path.
+# The bundled MsaIndexScore includes the Ascend 950 arch35 FP8 kernel for both
+# prefill and decode. A5 keeps its replicated index-K cache on each TP rank.
 _USE_ASCENDC_INDEX_SCORE_PREFILL = True
-_USE_ASCENDC_INDEX_SCORE_DECODE = get_ascend_device_type() != AscendDeviceType.A5
+_USE_ASCENDC_INDEX_SCORE_DECODE = True
 
 _MRV2_PADDING_DUMMY_KEY = "minimax_m3_mrv2_padding_dummy"
 _MRV2_DUMMY_INDEXER_TP_WARMED_KEY = "minimax_m3_mrv2_dummy_indexer_tp_warmed"
@@ -102,9 +102,8 @@ def _is_mrv2_idle_dp_dummy(forward_context: ForwardContext, *, use_v2_model_runn
 
 
 def _should_use_tp_sharded_index_decode(tp_size: int, num_prefills: int) -> bool:
-    # The A5 Triton decode kernel operates on the complete, replicated index-K
-    # cache on every TP rank. Keep the mainline block-sharded optimization for
-    # the other device families only.
+    # A5 scores the complete, replicated index-K cache on every TP rank with
+    # AscendC. Keep block sharding and its collectives on other device families.
     return get_ascend_device_type() != AscendDeviceType.A5 and tp_size > 1 and num_prefills == 0
 
 
@@ -397,7 +396,7 @@ class AscendMiniMaxM3IndexerMetadataBuilder(AttentionMetadataBuilder[AscendMiniM
                 cu_seqlens_q=decode_cu_seqlens_q,
                 context_lens=decode_context_lens,
             )
-            if _USE_ASCENDC_INDEX_SCORE_DECODE and self.tp_size > 1 and active_prefills == 0:
+            if _USE_ASCENDC_INDEX_SCORE_DECODE and _should_use_tp_sharded_index_decode(self.tp_size, active_prefills):
                 decode_metadata.tp_score = self._build_tp_score_metadata(
                     decode_metadata.block_table,
                     decode_cu_seqlens_q,
@@ -537,8 +536,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         if (
             _USE_ASCENDC_INDEX_SCORE_DECODE
             and index_md.num_decodes > 0
-            and index_md.num_prefills == 0
-            and get_tp_group().world_size > 1
+            and _should_use_tp_sharded_index_decode(get_tp_group().world_size, index_md.num_prefills)
             and _is_mrv2_idle_dp_dummy(forward_context, use_v2_model_runner=self.use_v2_model_runner)
         ):
             if forward_context.additional_kwargs.get(
@@ -563,7 +561,7 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
             tp_group = get_tp_group()
             decode_iq = iq[:num_decode_tokens]
             if _USE_ASCENDC_INDEX_SCORE_DECODE:
-                if tp_group.world_size > 1 and index_md.num_prefills == 0:
+                if _should_use_tp_sharded_index_decode(tp_group.world_size, index_md.num_prefills):
                     decode_topk = minimax_m3_index_tp_block_parallel_decode(
                         decode_iq,
                         kv,
