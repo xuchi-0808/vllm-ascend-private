@@ -33,6 +33,9 @@ _GBSA_BF16_MAX_QUERY_BATCH = 128
 _GBSA_BF16_MAX_FUSED_BUFFER_BYTES = 65536
 _GBSA_BF16_COPY_ALIGNMENT = 16
 _MSA_SCORE_BLOCK_ALIGNMENT = 16
+_MSA_DECODE_TOPK_MAX_COLUMNS = 2048
+_MSA_DECODE_TOPK_MAX_K = 128
+_MSA_DECODE_TOPK_ALIGNMENT = 8
 _FP8_E4M3_MAX = 448.0
 
 if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION):
@@ -597,6 +600,36 @@ def _index_score_topk_candidates(
     return topk_indices, topk_scores
 
 
+def _index_decode_topk_with_counts(
+    score: torch.Tensor,
+    context_lens: torch.Tensor,
+    decode_query_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse A5 decode masking, TopK and counts; keep the portable fallback."""
+    if (
+        get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+        and score.device.type == "npu"
+        and score.dtype == torch.float32
+        and score.stride(-1) == 1
+        and context_lens.dtype == torch.int32
+        and context_lens.is_contiguous()
+        and 0 < score.shape[-1] <= _MSA_DECODE_TOPK_MAX_COLUMNS
+        and 0 < topk <= _MSA_DECODE_TOPK_MAX_K
+        and topk % _MSA_DECODE_TOPK_ALIGNMENT == 0
+        and hasattr(torch.ops._C_ascend, "npu_msa_index_decode_topk")
+    ):
+        return torch.ops._C_ascend.npu_msa_index_decode_topk(
+            score, context_lens, decode_query_len, topk, init_blocks, local_blocks
+        )
+    indices, values = _index_score_topk_candidates(
+        score, context_lens, decode_query_len, topk, init_blocks=init_blocks, local_blocks=local_blocks
+    )
+    return indices, values, _select_num_idx_from_topk(indices)
+
+
 @torch.no_grad()
 def _minimax_m3_index_decode(
     idx_q: torch.Tensor,
@@ -655,8 +688,34 @@ def minimax_m3_index_decode(
     init_blocks: int,
     local_blocks: int,
     decode_query_len: int,
-) -> torch.Tensor:
-    """Compute AscendC decode scores and return their block TopK."""
+    return_select_num_idx: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Return block TopK, optionally with fused A5 valid-selection counts.
+
+    The default retains the A3/TP interface. A5 callers pass counts directly
+    to sparse attention to avoid a second reduction over TopK indices.
+    """
+    if return_select_num_idx:
+        score = _minimax_m3_index_score(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            start_loc,
+            causal_mask,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        )
+        indices, _, counts = _index_decode_topk_with_counts(
+            score[..., : block_table.shape[-1]],
+            context_lens,
+            decode_query_len,
+            topk,
+            init_blocks,
+            local_blocks,
+        )
+        return indices, counts
     topk_indices, _ = _minimax_m3_index_decode(
         idx_q,
         index_kv_cache,

@@ -780,17 +780,20 @@ def test_mrv2_idle_dp_skips_repeated_indexer_collectives_only_on_a3(
     mock_get_tp_group.return_value = SimpleNamespace(world_size=4)
     mock_get_vllm_config.side_effect = AssertionError("No current config during forward")
     expected = torch.zeros(1, 1, 2, dtype=torch.int32)
+    counts = torch.ones(1, 1, dtype=torch.int32)
+    direct_result = (expected, counts) if device_type == AscendDeviceType.A5 else expected
 
     with (
         patch.object(msa_m3_module, "get_ascend_device_type", return_value=device_type),
         patch.object(msa_m3_module, "minimax_m3_index_tp_block_parallel_decode", return_value=expected) as tp_decode,
-        patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=expected) as direct_decode,
+        patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=direct_result) as direct_decode,
     ):
         first = impl.forward(torch.zeros(1, 4))
         second = impl.forward(torch.zeros(1, 4))
 
     assert first[0] is expected
-    assert first[1:] == (None, None)
+    assert first[1] is None
+    assert first[2] is (counts if device_type == AscendDeviceType.A5 else None)
     if device_type == AscendDeviceType.A3:
         assert second == (None, None, None)
         tp_decode.assert_called_once()
@@ -799,7 +802,8 @@ def test_mrv2_idle_dp_skips_repeated_indexer_collectives_only_on_a3(
         assert forward_context.additional_kwargs[msa_m3_module._MRV2_SKIP_DUMMY_SPARSE_ATTN_KEY]
     else:
         assert second[0] is expected
-        assert second[1:] == (None, None)
+        assert second[1] is None
+        assert second[2] is counts
         assert direct_decode.call_count == 2
         tp_decode.assert_not_called()
         assert not forward_context.additional_kwargs
@@ -908,6 +912,8 @@ def test_indexer_decode_uses_ascendc_with_runtime_metadata(
     )
     tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0)
     expected = torch.zeros(1, decode_query_len, impl.topk_blocks, dtype=torch.int32)
+    counts = torch.full((1, decode_query_len), impl.topk_blocks, dtype=torch.int32)
+    direct_result = (expected, counts) if device_type == AscendDeviceType.A5 else expected
     common = _create_common_attn_metadata(
         BatchSpec(seq_lens=[128 + decode_query_len], query_lens=[decode_query_len]),
         block_size=128,
@@ -925,7 +931,7 @@ def test_indexer_decode_uses_ascendc_with_runtime_metadata(
                 "get_forward_context",
                 return_value=SimpleNamespace(attn_metadata={impl.index_cache.prefix: metadata}),
             ),
-            patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=expected) as direct_decode,
+            patch.object(msa_m3_module, "minimax_m3_index_decode_ascendc", return_value=direct_result) as direct_decode,
             patch.object(
                 msa_m3_module, "minimax_m3_index_tp_block_parallel_decode", return_value=expected
             ) as tp_decode,
@@ -939,7 +945,7 @@ def test_indexer_decode_uses_ascendc_with_runtime_metadata(
     torch.testing.assert_close(decode.context_lens, torch.tensor([128], dtype=torch.int32))
     assert actual is expected
     assert prefill is None
-    assert select_num_idx is None
+    assert select_num_idx is (counts if device_type == AscendDeviceType.A5 else None)
     triton_decode.assert_not_called()
     if tp_size > 1 and device_type != AscendDeviceType.A5:
         direct_decode.assert_not_called()
@@ -961,6 +967,7 @@ def test_indexer_decode_uses_ascendc_with_runtime_metadata(
         assert args[5] is decode.context_lens
         torch.testing.assert_close(args[6], torch.tensor([1], dtype=torch.int32))
         assert kwargs["decode_query_len"] == decode_query_len
+        assert kwargs["return_select_num_idx"] == (device_type == AscendDeviceType.A5)
     assert args[0].shape == (decode_query_len, 1, 4)
     assert args[1] is impl.index_cache.kv_cache
     assert args[-1] is metadata.causal_mask
@@ -2727,3 +2734,85 @@ def test_sparse_attn_prefill_dispatches_by_operator_availability(
         }
 
     mock_is_available.assert_called_once_with()
+
+
+@pytest.mark.parametrize("topk", [3, 8, 16])
+def test_index_decode_with_counts_portable_fallback(topk):
+    # CPU execution deliberately exercises the fallback, including padding and
+    # speculative queries that cross a block boundary.
+    raw = torch.tensor([[[4.0, 9.0, 8.0], [5.0, 7.0, 6.0]]])
+    context = torch.tensor([127], dtype=torch.int32)
+    expected, values = _index_score_topk_candidates(raw, context, 2, topk, init_blocks=1, local_blocks=1)
+    actual = msa_m3_npu_module._index_decode_topk_with_counts(raw, context, 2, topk, 1, 1)
+    torch.testing.assert_close(actual[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], values, rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], (expected >= 0).sum(-1).int(), rtol=0, atol=0)
+
+
+def test_index_decode_returns_fused_counts_without_reduction():
+    query = torch.zeros(2, 1, 128)
+    cache = torch.zeros(3, 128, 128)
+    table = torch.zeros(1, 3, dtype=torch.int32)
+    metadata = torch.zeros(1, dtype=torch.int32)
+    score = torch.randn(1, 2, 16)
+    indices = torch.zeros(1, 2, 8, dtype=torch.int32)
+    counts = torch.ones(1, 2, dtype=torch.int32)
+    with (
+        patch.object(msa_m3_npu_module, "_minimax_m3_index_score", return_value=score),
+        patch.object(
+            msa_m3_npu_module, "_index_decode_topk_with_counts", return_value=(indices, indices.float(), counts)
+        ) as fused,
+        patch.object(msa_m3_npu_module, "_select_num_idx_from_topk", side_effect=AssertionError("redundant reduction")),
+    ):
+        actual, selected = minimax_m3_index_decode(
+            query,
+            cache,
+            table,
+            metadata,
+            metadata,
+            metadata,
+            metadata,
+            metadata,
+            topk=8,
+            init_blocks=0,
+            local_blocks=1,
+            decode_query_len=2,
+            return_select_num_idx=True,
+        )
+    assert actual is indices and selected is counts
+    args = fused.call_args.args
+    torch.testing.assert_close(args[0], score[..., :3])
+    assert args[2:] == (2, 8, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "columns,topk,extension_available", [(80, 16, True), (80, 16, False), (2049, 16, True), (80, 7, True)]
+)
+def test_index_topk_fusion_dispatch_and_old_extension_fallback(columns, topk, extension_available):
+    score = MagicMock()
+    score.device.type = "npu"
+    score.dtype = torch.float32
+    score.shape = (1, 2, columns)
+    score.stride.return_value = 1
+    context = torch.zeros(1, dtype=torch.int32)
+    indices = torch.ones(1, 2, topk, dtype=torch.int32)
+    counts = torch.full((1, 2), topk, dtype=torch.int32)
+    values = indices.float()
+    native = MagicMock(return_value=(indices, values, counts))
+    extension = SimpleNamespace(npu_msa_index_decode_topk=native) if extension_available else SimpleNamespace()
+    with (
+        patch.object(
+            msa_m3_npu_module, "get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A5)
+        ),
+        patch.object(torch.ops, "_C_ascend", extension),
+        patch.object(msa_m3_npu_module, "_index_score_topk_candidates", return_value=(indices, values)) as fallback,
+    ):
+        result = msa_m3_npu_module._index_decode_topk_with_counts(score, context, 2, topk, 0, 1)
+    assert result[0] is indices and result[1] is values
+    torch.testing.assert_close(result[2], counts)
+    if extension_available and columns <= 2048 and topk % 8 == 0:
+        native.assert_called_once_with(score, context, 2, topk, 0, 1)
+        fallback.assert_not_called()
+    else:
+        native.assert_not_called()
+        fallback.assert_called_once()

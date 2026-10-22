@@ -59,6 +59,7 @@
 #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
 #ifdef VLLM_ASCEND_ENABLE_MSA_SPARSE_KERNELS
 #include "attention/msa_sparse_attention_fia/msa_sparse_attention_fia_torch_adpt.h"
+#include "attention/msa_sparse_attention_fia/msa_index_topk_torch_adpt.h"
 #endif
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
@@ -3661,6 +3662,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_msa_index_score);
 
 #ifdef VLLM_ASCEND_ENABLE_MSA_SPARSE_KERNELS
+    ops.def("npu_msa_index_decode_topk(Tensor score, Tensor context, int qlen, int topk, "
+            "int init_blocks=0, int local_blocks=0) -> (Tensor, Tensor, Tensor)");
+    ops.impl("npu_msa_index_decode_topk", torch::kPrivateUse1, &vllm_ascend::npu_msa_index_decode_topk);
     ops.def("npu_msa_sparse_attention_fia_metadata(Tensor indices, Tensor table, Tensor counts, "
             "Tensor prefix, Tensor lengths, int begin, int chunk, int page_count, int block_size) "
             "-> (Tensor, Tensor, Tensor)");

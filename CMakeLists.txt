@@ -70,6 +70,7 @@ if(SOC_VERSION MATCHES "^ascend950")
     # Keep the A5 metadata/copy kernels separate from legacy ATB/direct kernels.
     ascendc_library(vllm_ascend_msa_sparse_kernels SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/msa_sparse_attention_fia/msa_sparse_attention_fia_kernel.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/msa_sparse_attention_fia/msa_index_topk_kernel.cpp
     )
     if(TARGET vllm_ascend_msa_sparse_kernels_preprocess)
         # CANN 9.2's legacy preprocessor relinks objects in place. Regenerate

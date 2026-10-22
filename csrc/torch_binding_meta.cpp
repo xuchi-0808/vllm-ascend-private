@@ -372,6 +372,16 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_flash_mla_meta(
 }
 
 #ifdef VLLM_ASCEND_ENABLE_MSA_SPARSE_KERNELS
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_msa_index_decode_topk_meta(
+    const at::Tensor& score, const at::Tensor&, int64_t, int64_t topk, int64_t, int64_t)
+{
+    auto options = score.options().device(c10::kMeta);
+    auto indices = at::empty_symint(c10::SymDimVector{score.sym_size(0), score.sym_size(1), topk}, options.dtype(at::kInt));
+    auto values = at::empty_like(indices, options);
+    auto counts = at::empty_symint(c10::SymDimVector{score.sym_size(0), score.sym_size(1)}, options.dtype(at::kInt));
+    return {indices, values, counts};
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_msa_sparse_attention_fia_metadata_meta(
     const at::Tensor& indices, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
     int64_t, int64_t chunk, int64_t, int64_t blockSize)
@@ -1894,6 +1904,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::npu_sparse_attention_score_prefill_meta);
     ops.impl("npu_msa_index_score", &vllm_ascend::meta::npu_msa_index_score_meta);
 #ifdef VLLM_ASCEND_ENABLE_MSA_SPARSE_KERNELS
+    ops.impl("npu_msa_index_decode_topk", &vllm_ascend::meta::npu_msa_index_decode_topk_meta);
     ops.impl("npu_msa_sparse_attention_fia_metadata", &vllm_ascend::meta::npu_msa_sparse_attention_fia_metadata_meta);
     ops.impl("npu_msa_sparse_attention_fia_finish", &vllm_ascend::meta::npu_msa_sparse_attention_fia_finish_meta);
 #endif

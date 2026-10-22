@@ -8,8 +8,8 @@ Run in the prepared A5 vLLM-Ascend environment after sourcing CANN::
 
 Defaults cover batch={1,8}, query_len={1,2}, KV={10240,65536}, with one
 per-rank index head, dimension 128, and a complete randomly mapped block
-table. No TP process group is needed. Both paths include score, TopK, and
-valid-count generation: AscendC counts otherwise run inside the GBSA wrapper.
+table. No TP process group is needed. All paths include score, TopK, and
+valid-count generation. The unfused AscendC baseline retains separate counts.
 GBSA itself is excluded. This benchmark checks output contracts, not numerical
 precision; use test_msa_index_score.py for precision coverage.
 
@@ -86,7 +86,24 @@ def benchmark(
     mask = torch.zeros(2048, 2048, dtype=torch.int8, device=device)
 
     def ascendc():
-        indices = npu_ops.minimax_m3_index_decode(
+        return npu_ops.minimax_m3_index_decode(
+            query,
+            cache,
+            table,
+            prefix,
+            seq_lens,
+            context,
+            start_loc,
+            mask,
+            topk=args.topk,
+            init_blocks=0,
+            local_blocks=1,
+            decode_query_len=query_len,
+            return_select_num_idx=True,
+        )
+
+    def ascendc_unfused():
+        indices, _ = npu_ops._minimax_m3_index_decode(
             query,
             cache,
             table,
@@ -108,7 +125,7 @@ def benchmark(
     outputs = {}
     expected_counts = (kv_len - query_len + torch.arange(query_len) + block_size) // block_size
     expected_counts = expected_counts.clamp(max=args.topk).repeat(batch).unsqueeze(0).to(torch.int32)
-    for name, fn in (("ascendc", ascendc), ("triton", triton)):
+    for name, fn in (("ascendc", ascendc), ("ascendc_unfused", ascendc_unfused), ("triton", triton)):
         for _ in range(args.warmup):
             indices, counts = fn()
         indices, counts = indices.cpu(), counts.cpu()
@@ -118,12 +135,17 @@ def benchmark(
         torch.testing.assert_close((indices >= 0).sum(-1).to(torch.int32), counts, rtol=0, atol=0)
         assert ((indices >= -1) & (indices < blocks)).all(), name
         outputs[name] = indices
+    # The fusion must preserve the original score/TopK result (ordering of
+    # tied blocks is not specified by torch.topk).
+    torch.testing.assert_close(
+        outputs["ascendc"].sort(-1).values, outputs["ascendc_unfused"].sort(-1).values, rtol=0, atol=0
+    )
     overlap = []
     for row in range(batch * query_len):
         left = set(outputs["ascendc"][0, row].tolist()) - {-1}
         right = set(outputs["triton"][0, row].tolist()) - {-1}
         overlap.append(len(left & right) / max(1, len(left)))
-    functions = [("ascendc", ascendc), ("triton", triton)]
+    functions = [("ascendc", ascendc), ("ascendc_unfused", ascendc_unfused), ("triton", triton)]
     if (batch + query_len) % 2:
         functions.reverse()
     times = {name: latency_us(torch, fn, args) for name, fn in functions}
