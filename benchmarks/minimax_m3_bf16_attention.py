@@ -76,7 +76,7 @@ def benchmark(args, batch, query_len, kv_len):
             **common,
         )[0]
 
-    def high_precision():
+    def high_precision(use_fused=True):
         return _run_bf16_sparse_attention_high_precision(
             q,
             key,
@@ -89,6 +89,7 @@ def benchmark(args, batch, query_len, kv_len):
             num_kv_heads=1,
             sm_scale=dim**-0.5,
             block_size=block_size,
+            use_fused=use_fused,
         )
 
     settings = SimpleNamespace(
@@ -102,11 +103,13 @@ def benchmark(args, batch, query_len, kv_len):
         name: latency_us(torch, fn, settings)
         for name, fn in (
             ("low_precision_gbsa", low_precision_gbsa),
+            ("unfused_high_precision", lambda: high_precision(False)),
             ("high_precision", high_precision),
         )
     }
     settings.mode = "graph"
     graph = latency_us(torch, high_precision, settings)
+    unfused_graph = latency_us(torch, lambda: high_precision(False), settings)
     return {
         "batch": batch,
         "query_len": query_len,
@@ -118,6 +121,9 @@ def benchmark(args, batch, query_len, kv_len):
         "dtype": "bfloat16",
         "eager": eager,
         "high_precision_graph": graph,
+        "unfused_high_precision_graph": unfused_graph,
+        "fused_eager_speedup": eager["unfused_high_precision"]["median_us"] / eager["high_precision"]["median_us"],
+        "fused_graph_speedup": unfused_graph["median_us"] / graph["median_us"],
         "eager_high_over_low": eager["high_precision"]["median_us"] / eager["low_precision_gbsa"]["median_us"],
     }
 
@@ -147,7 +153,11 @@ def main():
 
     adapt_patch(True)
     adapt_patch()
+    from vllm_ascend.models.minimax_m3.ops.msa_m3_npu import _is_bf16_sparse_attention_fia_fused_available
+
     print(json.dumps({"device": torch.npu.get_device_name(args.device), "settings": vars(args)}), flush=True)
+    if not _is_bf16_sparse_attention_fia_fused_available():
+        raise RuntimeError("Rebuild the A5 extension with fused BF16 sparse-attention kernels")
     with torch.inference_mode():
         for batch, query_len, kv_len in itertools.product(args.batch, args.query_len, args.kv_len):
             print(json.dumps(benchmark(args, batch, query_len, kv_len)), flush=True)

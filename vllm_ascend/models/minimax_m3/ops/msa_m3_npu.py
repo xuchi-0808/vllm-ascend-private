@@ -30,6 +30,8 @@ _GBSA_SOFTMAX_PRECISION_DEFAULT = 0
 # Atlas A5 GBSA supports softmax_precision=1 for both BF16 and FP8 inputs.
 _GBSA_SOFTMAX_PRECISION_A5 = 1
 _GBSA_BF16_MAX_QUERY_BATCH = 128
+_GBSA_BF16_MAX_FUSED_BUFFER_BYTES = 65536
+_GBSA_BF16_COPY_ALIGNMENT = 16
 _MSA_SCORE_BLOCK_ALIGNMENT = 16
 _FP8_E4M3_MAX = 448.0
 
@@ -162,6 +164,18 @@ def _build_cu_seqlens_q(query_lens: torch.Tensor) -> torch.Tensor:
     return cu_seqlens_q
 
 
+@lru_cache
+def _is_bf16_sparse_attention_fia_fused_available() -> bool:
+    # A5 bypasses the generic custom-op loader. Import only after NPU init.
+    try:
+        import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401, PLC0415
+    except ImportError:
+        return False
+    return hasattr(torch.ops._C_ascend, "npu_msa_sparse_attention_fia_metadata") and hasattr(
+        torch.ops._C_ascend, "npu_msa_sparse_attention_fia_finish"
+    )
+
+
 @torch.no_grad()
 def _run_bf16_sparse_attention_high_precision(
     q: torch.Tensor,
@@ -176,6 +190,7 @@ def _run_bf16_sparse_attention_high_precision(
     num_kv_heads: int,
     sm_scale: float,
     block_size: int,
+    use_fused: bool = True,
 ) -> torch.Tensor:
     """Preserve BF16 inputs while avoiding A5 GBSA's BF16 score rounding.
 
@@ -183,7 +198,9 @@ def _run_bf16_sparse_attention_high_precision(
     per-query block table retains only the selected logical blocks; a device
     mask handles causality, selection counts and padding. FIA uses FP32
     intermediate scores with inner_precise=0, without materializing dense KV.
-    Query chunks bound the temporary query and mask storage during prefill.
+    A5 AscendC kernels fuse metadata preparation and output gathering. Older
+    extensions retain the equivalent PyTorch path. Query chunks bound the
+    temporary query and mask storage during prefill.
     """
     num_tokens, num_heads, head_dim = q.shape
     if num_kv_heads <= 0 or num_heads % num_kv_heads or key.shape[2] != num_kv_heads:
@@ -196,30 +213,55 @@ def _run_bf16_sparse_attention_high_precision(
     # layout. These views preserve its storage and do not gather or cast KV.
     paged_key = key.flatten(2)
     paged_value = value.flatten(2)
-    row_ids = torch.arange(block_size, device=q.device)
-    slot_ids = torch.arange(topk, device=q.device)
+    use_fused = (
+        use_fused
+        and q.device.type == "npu"
+        and q.dtype == torch.bfloat16
+        and block_size == _MSA_INDEX_BLOCK_SIZE
+        and topk * block_size <= _GBSA_BF16_MAX_FUSED_BUFFER_BYTES
+        and group_size * head_dim % _GBSA_BF16_COPY_ALIGNMENT == 0
+        and group_size * head_dim * q.element_size() <= _GBSA_BF16_MAX_FUSED_BUFFER_BYTES
+        and all(t.is_contiguous() for t in (topk_idx, block_table, select_num_idx, cu_seqlens_q, seq_lens))
+        and _is_bf16_sparse_attention_fia_fused_available()
+    )
+    if not use_fused:
+        row_ids = torch.arange(block_size, device=q.device)
+        slot_ids = torch.arange(topk, device=q.device)
     chunk_size = max(1, _GBSA_BF16_MAX_QUERY_BATCH // num_kv_heads)
-    output = torch.empty_like(q)
+    output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     for begin in range(0, num_tokens, chunk_size):
         end = min(begin + chunk_size, num_tokens)
-        tokens = torch.arange(begin, end, device=q.device)
-        requests = torch.searchsorted(cu_seqlens_q[1:].contiguous(), tokens, right=True)
-        query_pos = seq_lens[requests] - (cu_seqlens_q[requests + 1] - cu_seqlens_q[requests])
-        query_pos = query_pos + tokens - cu_seqlens_q[requests]
-        indices = topk_idx[:, begin:end]
-        safe_indices = indices.long().clamp(min=0, max=block_table.shape[1] - 1)
-        pages = block_table[requests[None, :, None], safe_indices]
-        pages = pages.clamp(min=0, max=key.shape[0] - 1).reshape(num_kv_heads * (end - begin), topk)
-        positions = indices[..., None] * block_size + row_ids
-        valid = (
-            (indices[..., None] >= 0)
-            & (indices[..., None] < block_table.shape[1])
-            & (positions <= query_pos[None, :, None, None])
-            & (positions < seq_lens[requests][None, :, None, None])
-            & (slot_ids[None, None, :, None] < select_num_idx[:, begin:end, None, None])
-        )
         batch = num_kv_heads * (end - begin)
-        mask = ~valid.reshape(batch, 1, 1, topk * block_size)
+        if use_fused:
+            pages, mask, valid = torch.ops._C_ascend.npu_msa_sparse_attention_fia_metadata(
+                topk_idx,
+                block_table,
+                select_num_idx,
+                cu_seqlens_q,
+                seq_lens,
+                begin,
+                end - begin,
+                key.shape[0],
+                block_size,
+            )
+        else:
+            tokens = torch.arange(begin, end, device=q.device)
+            requests = torch.searchsorted(cu_seqlens_q[1:].contiguous(), tokens, right=True)
+            query_pos = seq_lens[requests] - (cu_seqlens_q[requests + 1] - cu_seqlens_q[requests])
+            query_pos = query_pos + tokens - cu_seqlens_q[requests]
+            indices = topk_idx[:, begin:end]
+            safe_indices = indices.long().clamp(min=0, max=block_table.shape[1] - 1)
+            pages = block_table[requests[None, :, None], safe_indices]
+            pages = pages.clamp(min=0, max=key.shape[0] - 1).reshape(num_kv_heads * (end - begin), topk)
+            positions = indices[..., None] * block_size + row_ids
+            valid = (
+                (indices[..., None] >= 0)
+                & (indices[..., None] < block_table.shape[1])
+                & (positions <= query_pos[None, :, None, None])
+                & (positions < seq_lens[requests][None, :, None, None])
+                & (slot_ids[None, None, :, None] < select_num_idx[:, begin:end, None, None])
+            )
+            mask = ~valid.reshape(batch, 1, 1, topk * block_size)
         # Each KV head can select different pages. Repeating the small query
         # lets FIA retain the original cache's complete head layout; only the
         # corresponding GQA output group is kept after the call.
@@ -240,10 +282,13 @@ def _run_bf16_sparse_attention_high_precision(
             sparse_mode=0,
             inner_precise=0,
         )
-        out = torch.where(valid.reshape(batch, -1).any(-1)[:, None, None], out, 0)
-        out = out.reshape(num_kv_heads, end - begin, num_kv_heads, group_size, head_dim)
-        groups = [out[head, :, head] for head in range(num_kv_heads)]
-        output[begin:end].copy_(torch.stack(groups, dim=1).reshape(end - begin, num_heads, head_dim))
+        if use_fused:
+            torch.ops._C_ascend.npu_msa_sparse_attention_fia_finish(out, valid, output[begin:end], num_kv_heads)
+        else:
+            out = torch.where(valid.reshape(batch, -1).any(-1)[:, None, None], out, 0)
+            out = out.reshape(num_kv_heads, end - begin, num_kv_heads, group_size, head_dim)
+            groups = [out[head, :, head] for head in range(num_kv_heads)]
+            output[begin:end].copy_(torch.stack(groups, dim=1).reshape(end - begin, num_heads, head_dim))
     return output
 
 
