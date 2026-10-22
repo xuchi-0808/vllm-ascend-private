@@ -4,11 +4,6 @@ This page records the private A3 W8A8 integration snapshot. It distinguishes
 repository patches from native build artifacts and deployment configuration.
 The completed checks below do not establish full-model or GPQA accuracy.
 
-For the later, separate single-node Flash DSpark experiment, see
-[MiniMax-M3.1-Flash + DSpark](MiniMax-M3.1-Flash-DSpark.md). Its operator rebuild,
-standalone adapter and seven-request smoke results are distinct from this
-historical PD snapshot.
-
 ## Audited A3 source and image identity
 
 | Component | Pinned identity |
