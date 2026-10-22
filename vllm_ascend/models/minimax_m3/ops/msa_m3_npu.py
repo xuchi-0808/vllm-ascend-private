@@ -25,7 +25,9 @@ _MSA_INDEX_BLOCK_SIZE = 128
 _GBSA_MASK_MODE_CAUSAL = 1
 _GBSA_NO_QUANT = 0
 _GBSA_FP8_STATIC_CAST_P = 5
-_GBSA_SOFTMAX_PRECISION = 0
+_GBSA_SOFTMAX_PRECISION_DEFAULT = 0
+# Atlas A5 GBSA supports softmax_precision=1 for both BF16 and FP8 inputs.
+_GBSA_SOFTMAX_PRECISION_A5 = 1
 _MSA_SCORE_BLOCK_ALIGNMENT = 16
 _FP8_E4M3_MAX = 448.0
 
@@ -195,6 +197,11 @@ def _run_generic_block_sparse_attention(
     elif q.dtype != key.dtype or value.dtype != key.dtype:
         raise TypeError("MiniMax-M3 sparse attention requires Q, K, and V to have the same dtype")
 
+    softmax_precision = (
+        _GBSA_SOFTMAX_PRECISION_A5
+        if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+        else _GBSA_SOFTMAX_PRECISION_DEFAULT
+    )
     block_shape = [1, block_size]
     from cann_ops_transformer.ops import (  # type: ignore[import-not-found]  # noqa: PLC0415
         generic_block_sparse_attention,
@@ -230,7 +237,7 @@ def _run_generic_block_sparse_attention(
             layout_kv="PA_BBND",
             mask_mode=_GBSA_MASK_MODE_CAUSAL,
             quant_mode=quant_mode,
-            softmax_precision=_GBSA_SOFTMAX_PRECISION,
+            softmax_precision=softmax_precision,
         )
         if cache is not None:
             cache[cache_key] = gbsa_metadata
@@ -250,7 +257,7 @@ def _run_generic_block_sparse_attention(
         softmax_scale=sm_scale,
         mask_mode=_GBSA_MASK_MODE_CAUSAL,
         quant_mode=quant_mode,
-        softmax_precision=_GBSA_SOFTMAX_PRECISION,
+        softmax_precision=softmax_precision,
         return_softmax_lse=False,
         **quant_kwargs,
     )

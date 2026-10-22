@@ -2114,11 +2114,15 @@ def test_sparse_attn_prefill_kv_gather_q_forwards_csr_metadata(
 
 
 @pytest.mark.parametrize("reuse_prefix", [False, True])
+@pytest.mark.parametrize("device_type,softmax_precision", [(AscendDeviceType.A3, 0), (AscendDeviceType.A5, 1)])
 def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
     monkeypatch: pytest.MonkeyPatch,
     reuse_prefix: bool,
+    device_type: AscendDeviceType,
+    softmax_precision: int,
 ) -> None:
+    monkeypatch.setattr(msa_m3_npu_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
     q = torch.zeros(4, 2, 4, dtype=torch.bfloat16)
     kv_cache = torch.zeros(2, 6, 128, 2, 4, dtype=torch.bfloat16)
     topk_idx = torch.tensor(
@@ -2179,7 +2183,7 @@ def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     assert metadata_kwargs["layout_kv"] == "PA_BBND"
     assert metadata_kwargs["mask_mode"] == 1
     assert metadata_kwargs["quant_mode"] == 0
-    assert metadata_kwargs["softmax_precision"] == 0
+    assert metadata_kwargs["softmax_precision"] == softmax_precision
     assert "is_packed_gqa" not in metadata_kwargs
 
     gbsa_attention_op.assert_called_once()
@@ -2196,7 +2200,7 @@ def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     assert kwargs["softmax_scale"] == 0.5
     assert kwargs["mask_mode"] == 1
     assert kwargs["quant_mode"] == 0
-    assert kwargs["softmax_precision"] == 0
+    assert kwargs["softmax_precision"] == softmax_precision
     assert kwargs["return_softmax_lse"] is False
     assert "is_packed_gqa" not in kwargs
     assert torch.equal(output, torch.ones_like(output))
@@ -2453,8 +2457,12 @@ def test_m3_impls_provide_update_graph_params_protocol():
 @pytest.mark.parametrize("decode_query_len", [1, 2])
 def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
+    monkeypatch: pytest.MonkeyPatch,
     decode_query_len: int,
 ) -> None:
+    monkeypatch.setattr(
+        msa_m3_npu_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A5)
+    )
     q = torch.tensor([[[500.0, -500.0, 1.0, -1.0]]] * decode_query_len, dtype=torch.bfloat16)
     kv_cache = torch.zeros(2, 1, 128, 1, 4, dtype=torch.float8_e4m3fn)
     topk_idx = torch.zeros(1, decode_query_len, 1, dtype=torch.int32)
@@ -2484,6 +2492,7 @@ def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
 
     metadata_kwargs = gbsa_metadata_op.call_args.kwargs
     assert metadata_kwargs["quant_mode"] == 5
+    assert metadata_kwargs["softmax_precision"] == 1
     assert metadata_kwargs["max_seqlen_q"] == decode_query_len
     assert torch.equal(
         metadata_kwargs["cu_seqlens_q"],
@@ -2498,6 +2507,7 @@ def test_sparse_attn_decode_npu_uses_fp8_inputs_without_unsupported_scales(
     torch.testing.assert_close(args[0].float(), q.float().clamp(-448, 448))
     assert torch.equal(args[4], select_num_idx)
     assert kwargs["quant_mode"] == 5
+    assert kwargs["softmax_precision"] == 1
     assert "q_dequant_scale" not in kwargs
     assert "k_dequant_scale" not in kwargs
     assert "v_dequant_scale" not in kwargs
@@ -2590,7 +2600,7 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
     gbsa_metadata_op.assert_called_once()
     metadata_kwargs = gbsa_metadata_op.call_args.kwargs
     assert metadata_kwargs["max_seqlen_q"] == 3
-    assert metadata_kwargs["softmax_precision"] == 0
+    assert metadata_kwargs["softmax_precision"] == 1
     assert torch.equal(metadata_kwargs["cu_seqlens_q"], torch.tensor([0, 2, 5], dtype=torch.int64))
     assert torch.equal(metadata_kwargs["seqused_kv"], torch.tensor([130, 3], dtype=torch.int32))
 
@@ -2602,7 +2612,7 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
     assert args[3] is topk_idx
     torch.testing.assert_close(args[4], torch.ones(5, 1, dtype=torch.int32))
     assert kwargs["metadata"] is metadata
-    assert kwargs["softmax_precision"] == 0
+    assert kwargs["softmax_precision"] == 1
     if dtype == torch.float8_e4m3fn:
         torch.testing.assert_close(args[0].float(), q.float().clamp(-448, 448))
         assert kwargs["attention_out_dtype"] == torch.bfloat16
