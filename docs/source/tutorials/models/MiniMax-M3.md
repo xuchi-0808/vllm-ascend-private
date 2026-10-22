@@ -34,6 +34,9 @@ For multi-node deployment, verify the communication environment by following [Ve
 For the private MiniMax-M3.1-Flash A3 integration snapshot, see the
 [source reproduction notes](MiniMax-M3-private-reproduction.md) for pinned
 source/native identities, build requirements, and the A5 draft-patch boundary.
+For the separate experimental Flash DSpark adapter, explicit core prerequisite,
+full operator rebuild and recorded single-node smoke tests, see
+[MiniMax-M3.1-Flash + DSpark](MiniMax-M3.1-Flash-DSpark.md).
 
 ### 4.1 Docker Image Installation
 

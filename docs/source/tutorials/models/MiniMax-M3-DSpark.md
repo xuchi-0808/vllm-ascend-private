@@ -1,5 +1,9 @@
 # MiniMax-M3 QuaRot + DSpark
 
+MiniMax-M3.1-Flash 使用不同的独立实验适配器，参见
+[MiniMax-M3.1-Flash + DSpark](MiniMax-M3.1-Flash-DSpark.md)。
+下述 QuaRot 词表与旋转转换不适用于 Flash；本页 GPQA 结果属于历史 M3 验证。
+
 ## Introduction
 
 本文记录 vLLM Ascend `releases/v0.30.0` 上旋转量化 MiniMax-M3 与
@@ -76,25 +80,31 @@ python -m pip install . --no-build-isolation --no-deps
 
 ## Deployment
 
-下面为实际验证命令，IP、网卡和权重路径按环境修改。
+下面保留历史验证参数；先设置实际环境的通信地址、网卡、权重和工作目录。
 
 ```bash
 #!/usr/bin/env bash
 set -eo pipefail
 ulimit -c 0
+export WORK_DIR=/path/to/m3-dspark-work
+export TARGET_MODEL=/path/to/MiniMax-M3-QuaRot
+export DRAFT_MODEL=/path/to/MiniMax-M3-DSpark
+export COMM_IP=communication-ip
+export COMM_IFACE=communication-interface
+export PORT=8000
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
 export VLLM_USE_V2_MODEL_RUNNER=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_BUFFSIZE=1024
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_ENGINE_READY_TIMEOUT_S=1800
-export VLLM_HOST_IP=192.168.13.197 HCCL_IF_IP=192.168.13.197
-export HCCL_SOCKET_IFNAME=enp209s0f0 GLOO_SOCKET_IFNAME=enp209s0f0 TP_SOCKET_IFNAME=enp209s0f0
+export VLLM_HOST_IP="$COMM_IP" HCCL_IF_IP="$COMM_IP"
+export HCCL_SOCKET_IFNAME="$COMM_IFACE" GLOO_SOCKET_IFNAME="$COMM_IFACE" TP_SOCKET_IFNAME="$COMM_IFACE"
 export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1
-cd /workspace
-exec vllm serve /mnt/weight/MiniMax/MiniMax-M3_quarot_iter_0626_5 \
+cd "$WORK_DIR"
+exec vllm serve "$TARGET_MODEL" \
  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
- --host 0.0.0.0 --port 11223 --served-model-name minimax-m3 \
+ --host 127.0.0.1 --port "$PORT" --served-model-name minimax-m3 \
  --trust-remote-code --quantization ascend --max-model-len 133000 \
  --tensor-parallel-size 4 --data-parallel-size 4 --api-server-count 1 \
  --max-num-batched-tokens 32768 --long-prefill-token-threshold 4096 \
@@ -102,7 +112,7 @@ exec vllm serve /mnt/weight/MiniMax/MiniMax-M3_quarot_iter_0626_5 \
  --gpu-memory-utilization 0.92 --reasoning-parser minimax_m3 \
  --limit-mm-per-prompt '{"image":1,"video":0}' \
  --enable-chunked-prefill --enable-prefix-caching --disable-hybrid-kv-cache-manager \
- --speculative-config '{"model":"/home/weights/MiniMax-M3-DSpark","method":"dspark","num_speculative_tokens":7,"enforce_eager":true}' \
+ --speculative-config "{\"model\":\"$DRAFT_MODEL\",\"method\":\"dspark\",\"num_speculative_tokens\":7,\"enforce_eager\":true}" \
  --additional-config '{"enable_cpu_binding":true,"enable_flashcomm1":true,"ascend_compilation_config":{"fuse_norm_quant":false},"multistream_overlap_shared_expert":true,"enable_shared_expert_dp":true,"weight_nz_mode":2}'
 ```
 
@@ -117,8 +127,8 @@ MoE dispatch 报所需 216,006,656 bytes、实际 209,715,200 bytes，扩大后�
 ## Functional Verification
 
 ```bash
-curl -fsS http://127.0.0.1:11223/v1/models
-curl -fsS http://127.0.0.1:11223/v1/chat/completions \
+curl -fsS "http://127.0.0.1:$PORT/v1/models"
+curl -fsS "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"minimax-m3","messages":[{"role":"user","content":"What is 2 + 2?"}],"temperature":0,"max_tokens":256,"chat_template_kwargs":{"thinking_mode":"enabled"}}'
 ```
@@ -136,9 +146,9 @@ AISBench 参数为 0-shot、并发 8、temperature 0.6、top_p 0.95、seed 42、
 thinking enabled、最大输出 65,536 tokens。测试服务器已有配置和数据：
 
 ```bash
-ais_bench /workspace/accuracy/short10_aisbench.py \
+ais_bench "$WORK_DIR/accuracy/short10_aisbench.py" \
   --num-prompts 10 --num-warmups 0 --dump-eval-details --dump-extract-rate \
-  -w /workspace/accuracy/dspark-fa3-short10-new
+  -w "$WORK_DIR/accuracy/dspark-fa3-short10-new"
 ```
 
 该配置及数据为服务器上的验证资产，不随本 PR 提交；新环境需按
@@ -162,8 +172,8 @@ ais_bench /workspace/accuracy/short10_aisbench.py \
 本轮未达到约 90% 的目标。不同运行同时改变 draft 和算子等配置，不能单独归因
 精度变化，也不能据此认定重复问题已彻底解决。
 
-验证资产位于服务器宿主机目录
-`/workspace/cxy-minimax-m3-dspark-v030-20261022`，容器内对应 `/workspace`：
+历史验证资产保存在服务器本地工作目录，下列路径相对于该目录；
+这些资产不随本 PR 提交，新环境需准备自己的 `$WORK_DIR`：
 
 - `serve-dspark-fa3.sh`、`serve-dspark-fa3.log`：启动配置和日志。
 - `accuracy/dspark-fa3-short10/20261022_172239/`：AISBench 原始预测和评分。
@@ -185,6 +195,7 @@ GPQA 区间的 metrics 前后差值排除冒烟请求：
 
 开发环境验证：相关单测 819 passed、1 skipped；实际 NPU 算子数值及图重放验证
 112 passed。覆盖 GQA、prefill/decode、推测验证、配置化因果/非因果滑窗和缓存页面变化。
-验证用测试文件保留在开发环境，按本 PR 范围要求不提交 tests 目录改动。
-格式检查使用 `bash format.sh ci`，真实权重 GPQA 结果如上；
+上述历史算子测试文件保留在原开发环境，未包含在最初同步中；
+后续 Flash 适配及其新增测试参见独立 Flash 文档。
+历史格式检查使用 `bash format.sh ci`，真实权重 GPQA 结果如上；
 算子和单测通过不能替代模型正确性验收。
