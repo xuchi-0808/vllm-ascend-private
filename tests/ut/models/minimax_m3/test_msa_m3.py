@@ -2114,17 +2114,21 @@ def test_sparse_attn_prefill_kv_gather_q_forwards_csr_metadata(
 
 
 @pytest.mark.parametrize("reuse_prefix", [False, True])
-@pytest.mark.parametrize("device_type,softmax_precision", [(AscendDeviceType.A3, 0), (AscendDeviceType.A5, 1)])
+@pytest.mark.parametrize(
+    "device_type,dtype,softmax_precision",
+    [(AscendDeviceType.A3, torch.bfloat16, 0), (AscendDeviceType.A5, torch.float16, 1)],
+)
 def test_sparse_attn_decode_npu_forwards_runtime_metadata(
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
     monkeypatch: pytest.MonkeyPatch,
     reuse_prefix: bool,
     device_type: AscendDeviceType,
+    dtype: torch.dtype,
     softmax_precision: int,
 ) -> None:
     monkeypatch.setattr(msa_m3_npu_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
-    q = torch.zeros(4, 2, 4, dtype=torch.bfloat16)
-    kv_cache = torch.zeros(2, 6, 128, 2, 4, dtype=torch.bfloat16)
+    q = torch.zeros(4, 2, 4, dtype=dtype)
+    kv_cache = torch.zeros(2, 6, 128, 2, 4, dtype=dtype)
     topk_idx = torch.tensor(
         [
             [[0, 1], [0, -1], [2, 3], [-1, -1]],
@@ -2556,7 +2560,7 @@ def test_sparse_attn_prefill_a5_uses_fp8_inputs(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("cache_layout", ["tensor", "tuple", "list"])
-def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
+def test_sparse_attn_prefill_missing_split_kv_uses_ascendc_attention(
     dtype,
     cache_layout,
     mock_gbsa_ops: tuple[MagicMock, MagicMock],
@@ -2579,6 +2583,9 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
         patch.object(msa_m3_npu_module, "_is_minimax_sparse_attention_split_kv_available", return_value=False),
         patch.object(msa_m3_npu_module, "_npu_k2q_csr") as k2q,
         patch("torch.ops._C_ascend.npu_sparse_attention_score_prefill", create=True) as split_kv,
+        patch.object(
+            msa_m3_npu_module, "_run_bf16_sparse_attention_high_precision", return_value=torch.ones_like(q)
+        ) as high_precision,
     ):
         msa_m3_module.minimax_m3_sparse_attn(
             q,
@@ -2597,6 +2604,16 @@ def test_sparse_attn_prefill_missing_split_kv_uses_cann_gbsa(
         )
     k2q.assert_not_called()
     split_kv.assert_not_called()
+    if dtype == torch.bfloat16:
+        gbsa_metadata_op.assert_not_called()
+        gbsa_attention_op.assert_not_called()
+        high_precision.assert_called_once()
+        assert high_precision.call_args.args[0] is q
+        assert high_precision.call_args.args[1].dtype == torch.bfloat16
+        assert high_precision.call_args.args[2].dtype == torch.bfloat16
+        torch.testing.assert_close(output, torch.ones_like(q))
+        return
+    high_precision.assert_not_called()
     gbsa_metadata_op.assert_called_once()
     metadata_kwargs = gbsa_metadata_op.call_args.kwargs
     assert metadata_kwargs["max_seqlen_q"] == 3

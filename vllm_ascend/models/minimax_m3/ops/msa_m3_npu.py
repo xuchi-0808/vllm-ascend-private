@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Any
 
 import torch
+import torch_npu
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.utils import enable_custom_op
@@ -28,6 +29,7 @@ _GBSA_FP8_STATIC_CAST_P = 5
 _GBSA_SOFTMAX_PRECISION_DEFAULT = 0
 # Atlas A5 GBSA supports softmax_precision=1 for both BF16 and FP8 inputs.
 _GBSA_SOFTMAX_PRECISION_A5 = 1
+_GBSA_BF16_MAX_QUERY_BATCH = 128
 _MSA_SCORE_BLOCK_ALIGNMENT = 16
 _FP8_E4M3_MAX = 448.0
 
@@ -161,6 +163,91 @@ def _build_cu_seqlens_q(query_lens: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _run_bf16_sparse_attention_high_precision(
+    q: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    select_num_idx: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    sm_scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    """Preserve BF16 inputs while avoiding A5 GBSA's BF16 score rounding.
+
+    Treat each query and KV head as an independent paged FIA request. The
+    per-query block table retains only the selected logical blocks; a device
+    mask handles causality, selection counts and padding. FIA uses FP32
+    intermediate scores with inner_precise=0, without materializing dense KV.
+    Query chunks bound the temporary query and mask storage during prefill.
+    """
+    num_tokens, num_heads, head_dim = q.shape
+    if num_kv_heads <= 0 or num_heads % num_kv_heads or key.shape[2] != num_kv_heads:
+        raise ValueError("Sparse attention Q and KV heads must form complete GQA groups")
+    if num_tokens == 0 or topk_idx.shape[-1] == 0 or key.shape[0] == 0:
+        return torch.zeros_like(q)
+    group_size = num_heads // num_kv_heads
+    topk = topk_idx.shape[-1]
+    # The last two dimensions of the paged cache are contiguous in the model
+    # layout. These views preserve its storage and do not gather or cast KV.
+    paged_key = key.flatten(2)
+    paged_value = value.flatten(2)
+    row_ids = torch.arange(block_size, device=q.device)
+    slot_ids = torch.arange(topk, device=q.device)
+    chunk_size = max(1, _GBSA_BF16_MAX_QUERY_BATCH // num_kv_heads)
+    output = torch.empty_like(q)
+    for begin in range(0, num_tokens, chunk_size):
+        end = min(begin + chunk_size, num_tokens)
+        tokens = torch.arange(begin, end, device=q.device)
+        requests = torch.searchsorted(cu_seqlens_q[1:].contiguous(), tokens, right=True)
+        query_pos = seq_lens[requests] - (cu_seqlens_q[requests + 1] - cu_seqlens_q[requests])
+        query_pos = query_pos + tokens - cu_seqlens_q[requests]
+        indices = topk_idx[:, begin:end]
+        safe_indices = indices.long().clamp(min=0, max=block_table.shape[1] - 1)
+        pages = block_table[requests[None, :, None], safe_indices]
+        pages = pages.clamp(min=0, max=key.shape[0] - 1).reshape(num_kv_heads * (end - begin), topk)
+        positions = indices[..., None] * block_size + row_ids
+        valid = (
+            (indices[..., None] >= 0)
+            & (indices[..., None] < block_table.shape[1])
+            & (positions <= query_pos[None, :, None, None])
+            & (positions < seq_lens[requests][None, :, None, None])
+            & (slot_ids[None, None, :, None] < select_num_idx[:, begin:end, None, None])
+        )
+        batch = num_kv_heads * (end - begin)
+        mask = ~valid.reshape(batch, 1, 1, topk * block_size)
+        # Each KV head can select different pages. Repeating the small query
+        # lets FIA retain the original cache's complete head layout; only the
+        # corresponding GQA output group is kept after the call.
+        query = q[None, begin:end].expand(num_kv_heads, -1, -1, -1)
+        query = query.reshape(batch, 1, num_heads * head_dim).contiguous()
+        out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            paged_key,
+            paged_value,
+            num_query_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            input_layout="BSH",
+            atten_mask=mask,
+            block_table=pages,
+            block_size=block_size,
+            actual_seq_kvlen=[topk * block_size] * batch,
+            softmax_scale=sm_scale,
+            sparse_mode=0,
+            inner_precise=0,
+        )
+        out = torch.where(valid.reshape(batch, -1).any(-1)[:, None, None], out, 0)
+        out = out.reshape(num_kv_heads, end - begin, num_kv_heads, group_size, head_dim)
+        groups = [out[head, :, head] for head in range(num_kv_heads)]
+        output[begin:end].copy_(torch.stack(groups, dim=1).reshape(end - begin, num_heads, head_dim))
+    return output
+
+
+@torch.no_grad()
 def _run_generic_block_sparse_attention(
     q: torch.Tensor,
     key: torch.Tensor,
@@ -178,7 +265,7 @@ def _run_generic_block_sparse_attention(
     dequant_scale: torch.Tensor | None = None,
     gbsa_metadata_cache: dict[tuple[Any, ...], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Run MiniMax-M3 sparse attention through CANN Ops GBSA."""
+    """Use CANN GBSA, with high-precision paged FIA for A5 BF16 inputs."""
     del dequant_scale
     topk_idx = topk_idx.to(dtype=torch.int32).contiguous()
     select_num_idx = select_num_idx.to(dtype=torch.int32).contiguous()
@@ -197,11 +284,22 @@ def _run_generic_block_sparse_attention(
     elif q.dtype != key.dtype or value.dtype != key.dtype:
         raise TypeError("MiniMax-M3 sparse attention requires Q, K, and V to have the same dtype")
 
-    softmax_precision = (
-        _GBSA_SOFTMAX_PRECISION_A5
-        if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
-        else _GBSA_SOFTMAX_PRECISION_DEFAULT
-    )
+    supports_fp8 = get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+    if supports_fp8 and key.dtype == torch.bfloat16:
+        return _run_bf16_sparse_attention_high_precision(
+            q,
+            key,
+            value,
+            topk_idx,
+            block_table,
+            select_num_idx,
+            cu_seqlens_q,
+            seq_lens,
+            num_kv_heads=num_kv_heads,
+            sm_scale=sm_scale,
+            block_size=block_size,
+        )
+    softmax_precision = _GBSA_SOFTMAX_PRECISION_A5 if supports_fp8 else _GBSA_SOFTMAX_PRECISION_DEFAULT
     block_shape = [1, block_size]
     from cann_ops_transformer.ops import (  # type: ignore[import-not-found]  # noqa: PLC0415
         generic_block_sparse_attention,
@@ -779,6 +877,12 @@ def minimax_m3_sparse_attn(
     )
     hardware_profile = get_current_hardware_profile()
     supports_fp8 = hardware_profile.supports(HardwareCapability.FP8_ATTENTION)
+    # The optional A5 split-KV BF16 path also uses low-precision scores. Keep
+    # BF16 prefill on the same high-precision route as decode regardless of
+    # whether that experimental package happens to be installed.
+    if supports_fp8 and q.dtype == torch.bfloat16 and _split_main_kv_cache(kv_cache)[0].dtype == torch.bfloat16:
+        _minimax_m3_sparse_attn_a3(*common_args, max_query_len=max_query_len)
+        return
     # Select the optional optimization by ACLNN availability. The installed
     # experimental package must provide kernels for the current device.
     if not _is_minimax_sparse_attention_split_kv_available():
@@ -811,7 +915,7 @@ def minimax_m3_sparse_attn_decode(
     cu_seqlens_q: torch.Tensor | None = None,
     gbsa_metadata_cache: dict[tuple[Any, ...], torch.Tensor] | None = None,
 ) -> None:
-    """Run sparse decode through CANN Ops generic block sparse attention."""
+    """Run sparse decode through CANN attention with device-specific precision."""
     if q.shape[0] != seq_lens.shape[0] * decode_query_len:
         raise ValueError("Decode query tokens must equal request count times decode_query_len")
 
