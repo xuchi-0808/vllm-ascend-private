@@ -252,6 +252,9 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        if _validate_flash_attn_backend(backend_key, attn_selector_config):
+            return "vllm_ascend.attention.fa_v1.AscendFlashAttentionBackend"
+
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
@@ -1525,6 +1528,49 @@ def _disable_expandable_segments() -> None:
     if updated_configs != npu_alloc_configs:
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = updated_configs
         logger.info("Removed expandable_segments from PYTORCH_NPU_ALLOC_CONF: %s", updated_configs)
+
+
+def _validate_flash_attn_backend(backend_key, selector) -> bool:
+    """Select PR #18717's CANN FA backend only while loading the DSpark draft."""
+    if backend_key != (False, False, False) or not get_current_hardware_profile().supports(
+        HardwareCapability.DEVICE_LENGTH_FLASH_ATTN
+    ):
+        return False
+
+    from vllm.compilation import backends
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.v1.attention.backend import AttentionType
+
+    config = get_current_vllm_config_or_none()
+    spec = config.speculative_config if config is not None else None
+    if spec is None or spec.method != "dspark" or not spec.enforce_eager:
+        return False
+    # V2 retains the target model_config during draft loading. The loader tag
+    # distinguishes the draft from target GQA layers with the same KV dtype.
+    if backends.model_tag != "dspark_head":
+        return False
+    if spec.target_model_config.hf_text_config.model_type != "minimax_m3_text":
+        return False
+    if "MiniMaxM31FlashA3DSparkModel" not in (spec.draft_model_config.architectures or []):
+        return False
+    parallel = config.parallel_config
+    return (
+        parallel.pipeline_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and not getattr(spec, "enable_adaptive_verification", False)
+        and selector.attn_type == AttentionType.DECODER
+        and selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            selector.use_pcp
+            or selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_per_head_quant_scales
+            or selector.use_batch_invariant
+            or selector.use_adaptive_verification
+        )
+    )
 
 
 def _validate_fa3_backend(key, _attn_selector_config):
