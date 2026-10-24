@@ -56,7 +56,7 @@
     "junit_file": "a3-pr18-ut.xml",
     "console_log": "a3-pr18-ut.log",
     "ut_sha256": {
-      "test_checkpoint_router_norm_equivalence.py": "c8ec6f89b64adc119abee257007f933d7fd24bc90846a5529e0a3b6d9aedcda6",
+      "test_checkpoint_router_norm_equivalence.py": "d8678c2d4f5ece3b6c52d9d156c4ee09f718aa5a89d285c5160538981192c593",
       "test_checkpoint_quarot_router_norm_equivalence.py": "be1e2f83d5e99ccc427524f2bc564b09652645d53e985d5db4f9200d5be5a221"
     }
   }
