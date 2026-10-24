@@ -6,3 +6,4 @@ This section provides guides for benchmarking, performance tuning, profiling, an
 - **[Optimization and Tuning](optimization_and_tuning.md)** — Performance optimization
 - **[Service Profiling Guide](service_profiling_guide.md)** — Service profiling
 - **[msprobe Guide](msprobe_guide.md)** — Debugging with msprobe
+- **[M3.1 Checkpoint Comparison](minimax_m31_checkpoint_comparison.md)** — Reproduce norm/router checkpoint differences
