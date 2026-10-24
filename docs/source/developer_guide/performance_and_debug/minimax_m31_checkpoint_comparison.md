@@ -1,5 +1,9 @@
 # M3.1 Flash checkpoint 的 norm/router 对比复现
 
+另见 [A3 BF16 / W8A8 QuaRot 检查](minimax_m31_a3_quarot_checkpoint_comparison.md)：
+对另一组实际部署权重，在对齐 QuaRot 旋转后复现了 26 层组合不等价，并附专项 UT 与逐层数据。
+本页以下的 35 层结果仍仅对应本页指定的 BF16 / MXFP8 checkpoint。
+
 ## 结论及范围
 
 本诊断确认两份指定 checkpoint 在部分层的 **norm 与 router 组合上不等价**。
