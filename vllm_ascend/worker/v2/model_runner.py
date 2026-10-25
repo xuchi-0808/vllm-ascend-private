@@ -59,6 +59,7 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
@@ -1044,6 +1045,35 @@ class NPUModelRunner(GPUModelRunner):
                 **kwargs,
             )
 
+    def _can_skip_spec_cpu_length_sync(self) -> bool:
+        if self.sync_spec_pp_cpu_counts:
+            return False
+        if is_deepseek_v41(self.model_config.hf_config):
+            return True
+
+        spec = self.speculative_config
+        if (
+            spec is None
+            or self.speculator is None
+            or spec.method != "dspark"
+            or self.model_config.hf_text_config.model_type != "minimax_m3_text"
+            or spec.draft_model_config is None
+            or not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+                spec.draft_model_config.architectures or []
+            )
+        ):
+            return False
+
+        backends = [group.backend for groups in self.attn_groups for group in groups]
+        # Keep the target's sparse implementation unchanged: decode uses exact
+        # device lengths; prefill independently reads them for host block counts.
+        # A target GQA layer using the old backend still needs the shared mirror.
+        return AscendFlashAttentionBackend in backends and all(
+            backend is AscendFlashAttentionBackend
+            or backend.get_name() in ("ASCEND_MINIMAX_M3_SPARSE", "ASCEND_MINIMAX_M3_SPARSE_INDEXER")
+            for backend in backends
+        )
+
     def postprocess_sampled(
         self,
         idx_mapping,
@@ -1090,6 +1120,8 @@ class NPUModelRunner(GPUModelRunner):
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
+        if self._can_skip_spec_cpu_length_sync():
+            return
         # Attention metadata still needs exact CPU lengths. This non-blocking
         # D2H is waited on in _update_seq_lens_cpu, introducing a host/device
         # sync point that can break asynchronous scheduling overlap.
@@ -1114,9 +1146,7 @@ class NPUModelRunner(GPUModelRunner):
         # Speculative decoding needs corrected num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
-        ) or self.sync_spec_pp_cpu_counts:
+        if (self.speculator is not None or self.sync_spec_pp_cpu_counts) and not self._can_skip_spec_cpu_length_sync():
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
