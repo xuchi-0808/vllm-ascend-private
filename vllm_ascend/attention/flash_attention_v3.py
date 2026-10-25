@@ -97,7 +97,6 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.device = device
-        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.capture_sizes = set(vllm_config.compilation_config.cudagraph_capture_sizes or [])
         self.capture_query_len = None
         if vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
@@ -151,9 +150,9 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         )
         # The runner owns graph-stable buffers. Device tiling limits reads to
         # active_reqs, so padding rows need neither copying nor sanitizing.
-        query_start_loc = common.query_start_loc[: active_reqs + 1]
-        seq_lens = common.seq_lens[:active_reqs]
-        block_tables = common.block_table_tensor[:active_reqs]
+        query_start_loc = common.query_start_loc
+        seq_lens = common.seq_lens
+        block_tables = common.block_table_tensor
         num_input_tokens = common.num_input_tokens or common.num_actual_tokens
         is_graph_capture_size = num_input_tokens in self.capture_sizes and (
             self.capture_query_len is None or common.max_query_len <= self.capture_query_len
@@ -170,7 +169,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
             # Distinct input buffers (including draft steps) and token buckets
             # must retain independent tiling storage even for identical specs.
             source_key = (query_start_loc.data_ptr(), seq_lens.data_ptr(), block_tables.data_ptr())
-            graph_key = (source_key, num_input_tokens, max_query_len)
+            graph_key = (source_key, max_query_len)
             # Select the inner spec -> tensor dictionary. The assignment below
             # to scheduler_metadata[spec] also updates scheduler_buffers[graph_key].
             scheduler_metadata = self.scheduler_buffers.setdefault(graph_key, {})
@@ -205,13 +204,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
                 num_splits=0,
             )
             if spec in scheduler_metadata:
-                scheduler_metadata[spec].resize_(tiling.shape).copy_(tiling)
-            elif is_graph_capture_size:
-                # 950 metadata appends an int32 KV offset per request. Reserve
-                # that tail once so changing active batch size keeps the address.
-                reserve = self.max_num_reqs * common.seq_lens.element_size()
-                buffer = tiling.new_empty(tiling.numel() + reserve)
-                scheduler_metadata[spec] = buffer[: tiling.numel()].copy_(tiling)
+                scheduler_metadata[spec].copy_(tiling)
             else:
                 scheduler_metadata[spec] = tiling
         return AscendFlashAttentionMetadata(
