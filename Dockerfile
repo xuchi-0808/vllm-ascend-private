@@ -26,6 +26,12 @@ FROM ${CANN_QUAY_URL}:${CANN_VERSION}-910b-ubuntu22.04-py3.12
 ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cpu/"
 # ASCEND_INDEX_URL (optional): Extra pip index URL for Ascend/CANN Python packages.
 ARG ASCEND_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi"
+# PIP_INDEX_URL (optional): Primary pip index URL; CI passes the internal mirror.
+ARG PIP_INDEX_URL=""
+# PIP_TRUSTED_HOST (optional): Extra trusted host for internal HTTP pip mirrors.
+ARG PIP_TRUSTED_HOST=""
+# GIT_PROXY (optional): Internal GitHub proxy prefix used by the FLA wheel download.
+ARG GIT_PROXY=""
 # MOONCAKE_TAG (optional): Version tag of the mooncake-transfer-engine-npu package.
 ARG MOONCAKE_TAG=0.3.11.post1
 # VLLM_REPO (optional): Git repository URL of vLLM.
@@ -99,7 +105,9 @@ ENV SOC_VERSION=$SOC_VERSION \
     OMP_NUM_THREADS=1
 COPY . /vllm-workspace/vllm-ascend/
 
-RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" && \
+RUN export PIP_EXTRA_INDEX_URL="${ASCEND_INDEX_URL}" \
+           PIP_INDEX_URL="${PIP_INDEX_URL}" \
+           PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}" && \
     export VLLM_BATCH_INVARIANT=1 && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
