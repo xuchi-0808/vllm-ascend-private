@@ -1551,7 +1551,9 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
         return False
     if spec.target_model_config.hf_text_config.model_type != "minimax_m3_text":
         return False
-    if "MiniMaxM31FlashA3DSparkModel" not in (spec.draft_model_config.architectures or []):
+    if not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+        spec.draft_model_config.architectures or []
+    ):
         return False
     parallel = config.parallel_config
     return (

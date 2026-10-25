@@ -57,7 +57,7 @@ class NoDeviceHostRead(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def config_for_minimax():
+def config_for_minimax(architecture="MiniMaxM31FlashA3DSparkModel"):
     target = NS(hf_text_config=NS(model_type="minimax_m3_text"), hf_config=NS(model_type="minimax_m3"))
     return NS(
         speculative_config=NS(
@@ -65,7 +65,7 @@ def config_for_minimax():
             enforce_eager=True,
             enable_adaptive_verification=False,
             target_model_config=target,
-            draft_model_config=NS(architectures=["MiniMaxM31FlashA3DSparkModel"]),
+            draft_model_config=NS(architectures=[architecture]),
         ),
         model_config=target,
         parallel_config=NS(pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1),
@@ -97,9 +97,19 @@ def selects_flash_attention(config, kv_dtype="bfloat16", model_tag="dspark_head"
         return _validate_flash_attn_backend((False, False, False), selector)
 
 
+@pytest.mark.parametrize("architecture", ["MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"])
+def test_native_and_prepared_minimax_drafts_select_flash_attention(architecture):
+    assert selects_flash_attention(config_for_minimax(architecture))
+
+
+@pytest.mark.parametrize("architecture", ["MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"])
 @pytest.mark.parametrize("model_tag", ["backbone", "default", "dflash_head"])
-def test_target_and_other_model_tags_keep_their_existing_backend(model_tag):
-    assert not selects_flash_attention(config_for_minimax(), model_tag=model_tag)
+def test_target_and_other_model_tags_keep_their_existing_backend(model_tag, architecture):
+    assert not selects_flash_attention(config_for_minimax(architecture), model_tag=model_tag)
+
+
+def test_unrelated_draft_keeps_its_existing_backend():
+    assert not selects_flash_attention(config_for_minimax("Qwen3DSparkModel"))
 
 
 @pytest.mark.parametrize(
@@ -255,13 +265,14 @@ def test_flash_attention_matches_reference_after_rejection_and_padding(dtype, ca
     torch.testing.assert_close(output.cpu().float(), expected, atol=0.025, rtol=0.025)
 
 
-def test_runner_skips_both_copy_and_wait_but_retains_pp_counts():
+@pytest.mark.parametrize("architecture", ["MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"])
+def test_runner_skips_both_copy_and_wait_but_retains_pp_counts(architecture):
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
     from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
     from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
     runner = object.__new__(NPUModelRunner)
-    runner.vllm_config = config_for_minimax()
+    runner.vllm_config = config_for_minimax(architecture)
     runner.model_config = runner.vllm_config.model_config
     runner.speculative_config = runner.vllm_config.speculative_config
     runner.sync_spec_pp_cpu_counts = False
@@ -283,7 +294,8 @@ def test_runner_skips_both_copy_and_wait_but_retains_pp_counts():
     assert not runner._can_skip_spec_cpu_length_sync()
 
 
-def test_target_host_length_consumer_keeps_shared_runner_sync():
+@pytest.mark.parametrize("architecture", ["MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"])
+def test_target_host_length_consumer_keeps_shared_runner_sync(architecture):
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
     from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
     from vllm_ascend.models.minimax_m3.msa_m3 import (
@@ -294,7 +306,7 @@ def test_target_host_length_consumer_keeps_shared_runner_sync():
 
     runner = object.__new__(NPUModelRunner)
     runner.model_config = config_for_minimax().model_config
-    runner.speculative_config = config_for_minimax().speculative_config
+    runner.speculative_config = config_for_minimax(architecture).speculative_config
     runner.speculator = object()
     runner.sync_spec_pp_cpu_counts = False
     runner.attn_groups = [

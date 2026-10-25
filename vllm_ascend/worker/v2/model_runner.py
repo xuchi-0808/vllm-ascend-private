@@ -1058,7 +1058,9 @@ class NPUModelRunner(GPUModelRunner):
             or spec.method != "dspark"
             or self.model_config.hf_text_config.model_type != "minimax_m3_text"
             or spec.draft_model_config is None
-            or "MiniMaxM31FlashA3DSparkModel" not in (spec.draft_model_config.architectures or [])
+            or not {"MiniMaxM31FlashA3DSparkModel", "DSparkMiniMaxDraftModel"}.intersection(
+                spec.draft_model_config.architectures or []
+            )
         ):
             return False
 
